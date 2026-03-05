@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.env
+sqt_progress.jsonl
+data/
