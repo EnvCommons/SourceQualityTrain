@@ -4,7 +4,7 @@
 
 ## Description
 
-SourceQualityTrain is a training environment for systematic review source quality assessment, based on FutureHouse's [SourceQuality](https://github.com/Future-House/LAB-Bench) benchmark. Agents are given questions about why specific studies were excluded from systematic reviews, and must use web search to identify the verbatim exclusion reason.
+SourceQualityTrain is an ORS training environment for systematic review source quality assessment, based on FutureHouse's [SourceQuality](https://github.com/Future-House/LAB-Bench) benchmark. Agents are given questions about why specific studies were excluded from systematic reviews, and must use web search to identify the verbatim exclusion reason.
 
 ## Capabilities
 
