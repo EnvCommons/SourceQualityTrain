@@ -70,6 +70,8 @@ Agents have access to three tools:
 | `fetch_url` | Fetch full text content from a URL using Tavily extract. Supports pagination for long documents. |
 | `submit_answer` | Submit a final answer with explanation. Triggers LLM grading and ends the episode. |
 
+Note that the `fetch_url` and `web_search` tools require Tavily, but are optional. If you want to use a different provider for search you can exclude these tools and use external tools instead.
+
 ## Time Horizon
 
 SourceQualityTrain is a multi-turn environment. Agents typically search for the relevant systematic review, fetch the review page from PubMed Central, locate the excluded studies table, and extract the specific exclusion reason.
