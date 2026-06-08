@@ -288,19 +288,50 @@ class SourceQualityTrain(Environment):
         PAGE_SIZE = 10000  # Characters per page
 
         try:
-            response = await self.tavily_client.extract(urls=[params.url])
+            # extract_depth="advanced" pulls more of the rendered page than the
+            # default basic depth — needed for large/JS-heavy PMC articles that
+            # otherwise come back empty or near-empty.
+            response = await self.tavily_client.extract(
+                urls=[params.url],
+                extract_depth="advanced",
+                format="text",
+            )
 
             results = response.get("results", [])
             if not results:
+                # Tavily produced no result object at all — usually a fetch
+                # failure (DNS/timeout/blocked) or an unsupported URL.
                 return ToolOutput(
-                    blocks=[TextBlock(type="text", text=f"No content extracted from {params.url}")],
+                    blocks=[TextBlock(type="text", text=(
+                        f"Could not fetch {params.url}: the extractor returned "
+                        f"no result. The URL may be unreachable, blocked, or "
+                        f"invalid. Try a different source or the article's PMC URL."
+                    ))],
                     metadata={"url": params.url, "results": []},
                     reward=0.0,
                     finished=False
                 )
 
-            result = results[0]
-            raw_content = result.get("raw_content", "")
+            raw_content = results[0].get("raw_content", "") or ""
+            if not raw_content.strip():
+                # A result came back but with no usable text — typically a
+                # JavaScript-gated page that renders content client-side, so the
+                # extractor saw only an empty shell. Surface that explicitly so
+                # the agent picks a different source instead of re-paging into an
+                # opaque empty response.
+                return ToolOutput(
+                    blocks=[TextBlock(type="text", text=(
+                        f"No readable text could be extracted from {params.url}. "
+                        f"The page appears to be JavaScript-gated or otherwise "
+                        f"served no content to the extractor. Try the article's "
+                        f"PubMed Central (PMC) full-text URL or a direct data/API "
+                        f"endpoint instead."
+                    ))],
+                    metadata={"url": params.url, "results": results, "empty_content": True},
+                    reward=0.0,
+                    finished=False
+                )
+
             total_length = len(raw_content)
 
             # Calculate pagination
