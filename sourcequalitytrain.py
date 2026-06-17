@@ -8,6 +8,7 @@ medical domains including oncology, cardiology, neurology, infectious disease,
 respiratory, musculoskeletal, gastroenterology, obstetrics, pediatrics, and more.
 """
 
+import asyncio
 import json
 import re
 import openai
@@ -229,54 +230,69 @@ class SourceQualityTrain(Environment):
         """
         return [TextBlock(type="text", text=self.config.question)]
 
+    async def _tavily_with_retry(self, label: str, call, *, max_attempts: int = 4):
+        """Call Tavily with exponential backoff, re-raising on persistent failure.
+
+        A genuinely-down dependency (exhausted quota, auth error) exhausts the
+        retries and re-raises, so the SDK marks the call ToolFailed and ends the
+        rollout. `call` returns a fresh awaitable on each attempt.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                return await call()
+            except Exception as e:
+                last_exc = e
+                if attempt < max_attempts - 1:
+                    wait = min(2 ** attempt, 30)
+                    print(f"TAVILY ERROR: {label} | {e} | retry in {wait}s (attempt {attempt + 1}/{max_attempts})")
+                    await asyncio.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
+
     @tool
     async def web_search(self, params: WebSearchInput) -> ToolOutput:
         """
         Search the web for systematic review or study information using Tavily.
         Returns search results with titles, URLs, and snippets.
         """
-        try:
-            response = await self.tavily_client.search(
+        response = await self._tavily_with_retry(
+            f"search({params.query!r})",
+            lambda: self.tavily_client.search(
                 query=params.query,
                 search_depth="basic",
-                max_results=5
-            )
+                max_results=5,
+            ),
+        )
 
-            results = response.get("results", [])
-            if not results:
-                return ToolOutput(
-                    blocks=[TextBlock(type="text", text="No search results found. Try a different query.")],
-                    metadata={"query": params.query, "results": []},
-                    reward=0.0,
-                    finished=False
-                )
-
-            display_parts = [f"Search results for: {params.query}\n"]
-            for i, result in enumerate(results, 1):
-                title = result.get("title", "No title")
-                url = result.get("url", "")
-                snippet = result.get("content", "")
-                display_parts.append(f"{i}. {title}\n   URL: {url}\n   {snippet}\n")
-
-            display_text = "\n".join(display_parts)
-
+        results = response.get("results", [])
+        if not results:
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=display_text)],
-                metadata={
-                    "query": params.query,
-                    "results": results,
-                    "count": len(results)
-                },
+                blocks=[TextBlock(type="text", text="No search results found. Try a different query.")],
+                metadata={"query": params.query, "results": []},
                 reward=0.0,
                 finished=False
             )
-        except Exception as e:
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Web search failed: {str(e)}")],
-                metadata={"query": params.query, "error": str(e)},
-                reward=0.0,
-                finished=False
-            )
+
+        display_parts = [f"Search results for: {params.query}\n"]
+        for i, result in enumerate(results, 1):
+            title = result.get("title", "No title")
+            url = result.get("url", "")
+            snippet = result.get("content", "")
+            display_parts.append(f"{i}. {title}\n   URL: {url}\n   {snippet}\n")
+
+        display_text = "\n".join(display_parts)
+
+        return ToolOutput(
+            blocks=[TextBlock(type="text", text=display_text)],
+            metadata={
+                "query": params.query,
+                "results": results,
+                "count": len(results)
+            },
+            reward=0.0,
+            finished=False
+        )
 
     @tool
     async def fetch_url(self, params: FetchUrlInput) -> ToolOutput:
@@ -287,90 +303,85 @@ class SourceQualityTrain(Environment):
         """
         PAGE_SIZE = 10000  # Characters per page
 
-        try:
-            # extract_depth="advanced" pulls more of the rendered page than the
-            # default basic depth — needed for large/JS-heavy PMC articles that
-            # otherwise come back empty or near-empty.
-            response = await self.tavily_client.extract(
+        # extract_depth="advanced" pulls more of the rendered page than the default
+        # basic depth — needed for large/JS-heavy PMC articles that otherwise come
+        # back empty or near-empty.
+        response = await self._tavily_with_retry(
+            f"extract({params.url!r})",
+            lambda: self.tavily_client.extract(
                 urls=[params.url],
                 extract_depth="advanced",
                 format="text",
-            )
+            ),
+        )
 
-            results = response.get("results", [])
-            if not results:
-                # Tavily produced no result object at all — usually a fetch
-                # failure (DNS/timeout/blocked) or an unsupported URL.
-                return ToolOutput(
-                    blocks=[TextBlock(type="text", text=(
-                        f"Could not fetch {params.url}: the extractor returned "
-                        f"no result. The URL may be unreachable, blocked, or "
-                        f"invalid. Try a different source or the article's PMC URL."
-                    ))],
-                    metadata={"url": params.url, "results": []},
-                    reward=0.0,
-                    finished=False
-                )
-
-            raw_content = results[0].get("raw_content", "") or ""
-            if not raw_content.strip():
-                # A result came back but with no usable text — typically a
-                # JavaScript-gated page that renders content client-side, so the
-                # extractor saw only an empty shell. Surface that explicitly so
-                # the agent picks a different source instead of re-paging into an
-                # opaque empty response.
-                return ToolOutput(
-                    blocks=[TextBlock(type="text", text=(
-                        f"No readable text could be extracted from {params.url}. "
-                        f"The page appears to be JavaScript-gated or otherwise "
-                        f"served no content to the extractor. Try the article's "
-                        f"PubMed Central (PMC) full-text URL or a direct data/API "
-                        f"endpoint instead."
-                    ))],
-                    metadata={"url": params.url, "results": results, "empty_content": True},
-                    reward=0.0,
-                    finished=False
-                )
-
-            total_length = len(raw_content)
-
-            # Calculate pagination
-            total_pages = max(1, (total_length + PAGE_SIZE - 1) // PAGE_SIZE)
-            page = max(1, min(params.page, total_pages))
-
-            # Extract the requested page
-            start_idx = (page - 1) * PAGE_SIZE
-            end_idx = min(start_idx + PAGE_SIZE, total_length)
-            page_content = raw_content[start_idx:end_idx]
-
-            # Build display text with pagination info
-            if total_pages == 1:
-                display_text = f"Content from {params.url}:\n\n{page_content}"
-            else:
-                display_text = f"Content from {params.url} (Page {page}/{total_pages}):\n\n{page_content}"
-                if page < total_pages:
-                    display_text += f"\n\n[Use fetch_url with page={page + 1} to see more content]"
-
+        results = response.get("results", [])
+        if not results:
+            # Tavily produced no result object at all — usually a fetch
+            # failure (DNS/timeout/blocked) or an unsupported URL.
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=display_text)],
-                metadata={
-                    "url": params.url,
-                    "page": page,
-                    "total_pages": total_pages,
-                    "total_length": total_length,
-                    "page_start": start_idx,
-                    "page_end": end_idx
-                },
+                blocks=[TextBlock(type="text", text=(
+                    f"Could not fetch {params.url}: the extractor returned "
+                    f"no result. The URL may be unreachable, blocked, or "
+                    f"invalid. Try a different source or the article's PMC URL."
+                ))],
+                metadata={"url": params.url, "results": []},
                 reward=0.0,
                 finished=False
             )
-        except Exception as e:
+
+        raw_content = results[0].get("raw_content", "") or ""
+        if not raw_content.strip():
+            # A result came back but with no usable text — typically a
+            # JavaScript-gated page that renders content client-side, so the
+            # extractor saw only an empty shell. Surface that explicitly so
+            # the agent picks a different source instead of re-paging into an
+            # opaque empty response.
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Failed to fetch URL: {str(e)}")],
-                metadata={"url": params.url, "error": str(e)},
+                blocks=[TextBlock(type="text", text=(
+                    f"No readable text could be extracted from {params.url}. "
+                    f"The page appears to be JavaScript-gated or otherwise "
+                    f"served no content to the extractor. Try the article's "
+                    f"PubMed Central (PMC) full-text URL or a direct data/API "
+                    f"endpoint instead."
+                ))],
+                metadata={"url": params.url, "results": results, "empty_content": True},
                 reward=0.0,
                 finished=False
             )
+
+        total_length = len(raw_content)
+
+        # Calculate pagination
+        total_pages = max(1, (total_length + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(1, min(params.page, total_pages))
+
+        # Extract the requested page
+        start_idx = (page - 1) * PAGE_SIZE
+        end_idx = min(start_idx + PAGE_SIZE, total_length)
+        page_content = raw_content[start_idx:end_idx]
+
+        # Build display text with pagination info
+        if total_pages == 1:
+            display_text = f"Content from {params.url}:\n\n{page_content}"
+        else:
+            display_text = f"Content from {params.url} (Page {page}/{total_pages}):\n\n{page_content}"
+            if page < total_pages:
+                display_text += f"\n\n[Use fetch_url with page={page + 1} to see more content]"
+
+        return ToolOutput(
+            blocks=[TextBlock(type="text", text=display_text)],
+            metadata={
+                "url": params.url,
+                "page": page,
+                "total_pages": total_pages,
+                "total_length": total_length,
+                "page_start": start_idx,
+                "page_end": end_idx
+            },
+            reward=0.0,
+            finished=False
+        )
 
     async def _grade_answer(
         self,
