@@ -17,7 +17,7 @@ from typing import Dict, List
 
 from tavily import AsyncTavilyClient
 
-from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, tool
+from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, terminal, tool
 
 from constants import SOURCEQUALITYTRAIN_JSONL
 
@@ -80,11 +80,8 @@ class FetchUrlInput(BaseModel):
 
 
 class SubmitAnswerParams(BaseModel):
-    """Parameters for submit_answer tool"""
-    explanation: str = Field(
-        ...,
-        description="Your reasoning showing how you found and verified the answer (2-4 sentences)"
-    )
+    """Parameters for the terminal grading tool. The assistant's final message
+    becomes `answer` — include the precise exclusion reason there."""
     answer: str = Field(
         ...,
         description="The precise reason why the study was excluded from the systematic review"
@@ -228,7 +225,13 @@ class SourceQualityTrain(Environment):
         Returns:
             List containing single TextBlock with question
         """
-        return [TextBlock(type="text", text=self.config.question)]
+        text = (
+            f"{self.config.question}\n\n"
+            "Reply with the precise exclusion reason as an ordinary message when "
+            "you're ready. Your whole reply is graded, so keep it focused — no "
+            "preamble or closing remarks."
+        )
+        return [TextBlock(type="text", text=text)]
 
     async def _tavily_with_retry(self, label: str, call, *, max_attempts: int = 4):
         """Call Tavily with exponential backoff, re-raising on persistent failure.
@@ -426,21 +429,10 @@ class SourceQualityTrain(Environment):
             "grading_response": grading_text
         }
 
+    @terminal
     @tool
     async def submit_answer(self, params: SubmitAnswerParams) -> ToolOutput:
-        """
-        Submit your final answer for why the study was excluded from the systematic review.
-
-        This tool grades your answer using an LLM judge and returns a reward.
-        The episode ends after calling this tool.
-
-        Args:
-            explanation: Your reasoning and how you found the answer (2-4 sentences)
-            answer: The precise exclusion reason
-
-        Returns:
-            ToolOutput with grading result, reward, and feedback
-        """
+        """Grade the assistant's final message against the reference exclusion reason."""
         grading_result = await self._grade_answer(params.answer)
 
         reward = 1.0 if grading_result["is_correct"] else 0.0
@@ -465,7 +457,6 @@ Review: {self.config.review_url}"""
                 "is_correct": grading_result["is_correct"],
                 "grading_response": grading_result["grading_response"],
                 "submitted_answer": params.answer,
-                "submitted_explanation": params.explanation,
                 "correct_answer": self.config.answer,
                 "question": self.config.question,
                 "review_url": self.config.review_url,

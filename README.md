@@ -62,19 +62,16 @@ Data is stored on the OpenReward platform.
 
 ## Tools
 
-Agents have access to three tools:
-
 | Tool | Description |
 |------|-------------|
 | `web_search` | Search the web using Tavily. Returns titles, URLs, and snippets. |
 | `fetch_url` | Fetch full text content from a URL using Tavily extract. Supports pagination for long documents. |
-| `submit_answer` | Submit a final answer with explanation. Triggers LLM grading and ends the episode. |
 
-Note that the `fetch_url` and `web_search` tools require Tavily, but are optional. If you want to use a different provider for search you can exclude these tools and use external tools instead.
+Grading uses a hidden `@terminal` tool: the agent's final plain-text message is the answer, graded by an LLM judge (`gpt-5-mini`) for semantic equivalence against the reference exclusion reason. The `web_search` / `fetch_url` tools require Tavily but are optional — you can exclude them and use external tools instead.
 
 ## Time Horizon
 
-SourceQualityTrain is a multi-turn environment. Agents typically search for the relevant systematic review, fetch the review page from PubMed Central, locate the excluded studies table, and extract the specific exclusion reason.
+SourceQualityTrain is a multi-turn environment. Agents typically search for the relevant systematic review, fetch the review page from PubMed Central, locate the excluded studies table, and reply with the specific exclusion reason.
 
 ## Environment Difficulty
 
