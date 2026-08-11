@@ -55,6 +55,10 @@ Your explanation of the evaluation here.
 ## EVALUATION ##"""
 
 
+MAX_FIND_MATCHES = 5
+FIND_CONTEXT_CHARS = 400
+
+
 # Pydantic schemas for type safety
 class SourceQualityTaskSpec(BaseModel):
     """Task specification for SourceQualityTrain environment"""
@@ -77,6 +81,15 @@ class FetchUrlInput(BaseModel):
     """Parameters for fetch_url tool"""
     url: str = Field(..., description="URL to fetch (e.g., PubMed Central systematic review page)")
     page: int = Field(default=1, description="Page number to retrieve (1-indexed). Each page contains ~10,000 characters.")
+    find: str | None = Field(
+        default=None,
+        description=(
+            "Optional text to locate in the document instead of returning a page. "
+            "Returns every page number whose text contains it, each with a short "
+            "surrounding excerpt — use this to jump straight to a section such as "
+            "'characteristics of excluded studies' instead of paging through the article."
+        ),
+    )
 
 
 class SubmitAnswerParams(BaseModel):
@@ -181,6 +194,7 @@ class SourceQualityTrain(Environment):
 
         self.openai_client = openai.AsyncClient(api_key=openai_api_key)
         self.tavily_client = AsyncTavilyClient(api_key=tavily_api_key)
+        self._extract_cache: dict[str, str] = {}
 
     @classmethod
     def list_splits(cls) -> list[str]:
@@ -303,8 +317,14 @@ class SourceQualityTrain(Environment):
         Fetch and return the text content from a specific URL using Tavily's extract method.
         Use this to read systematic review pages from PubMed Central.
         Content is paginated - use the page parameter to retrieve additional pages.
+        Pass `find` to locate a phrase and be told which pages contain it, instead
+        of paging through the document.
         """
         PAGE_SIZE = 10000  # Characters per page
+
+        cached = self._extract_cache.get(params.url)
+        if cached is not None:
+            return self._paginate_content(params, cached, PAGE_SIZE, cached_hit=True)
 
         # extract_depth="advanced" pulls more of the rendered page than the default
         # basic depth — needed for large/JS-heavy PMC articles that otherwise come
@@ -353,24 +373,37 @@ class SourceQualityTrain(Environment):
                 finished=False
             )
 
+        self._extract_cache[params.url] = raw_content
+        return self._paginate_content(params, raw_content, PAGE_SIZE, cached_hit=False)
+
+    def _paginate_content(
+        self,
+        params: FetchUrlInput,
+        raw_content: str,
+        page_size: int,
+        *,
+        cached_hit: bool,
+    ) -> ToolOutput:
         total_length = len(raw_content)
+        total_pages = max(1, (total_length + page_size - 1) // page_size)
 
-        # Calculate pagination
-        total_pages = max(1, (total_length + PAGE_SIZE - 1) // PAGE_SIZE)
+        if params.find:
+            return self._find_in_content(params, raw_content, page_size, total_pages)
+
         page = max(1, min(params.page, total_pages))
-
-        # Extract the requested page
-        start_idx = (page - 1) * PAGE_SIZE
-        end_idx = min(start_idx + PAGE_SIZE, total_length)
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_length)
         page_content = raw_content[start_idx:end_idx]
 
-        # Build display text with pagination info
         if total_pages == 1:
             display_text = f"Content from {params.url}:\n\n{page_content}"
         else:
             display_text = f"Content from {params.url} (Page {page}/{total_pages}):\n\n{page_content}"
             if page < total_pages:
-                display_text += f"\n\n[Use fetch_url with page={page + 1} to see more content]"
+                display_text += (
+                    f"\n\n[Use fetch_url with page={page + 1} to see more content, "
+                    f"or with find=\"<text>\" to jump to a section]"
+                )
 
         return ToolOutput(
             blocks=[TextBlock(type="text", text=display_text)],
@@ -380,7 +413,61 @@ class SourceQualityTrain(Environment):
                 "total_pages": total_pages,
                 "total_length": total_length,
                 "page_start": start_idx,
-                "page_end": end_idx
+                "page_end": end_idx,
+                "cached": cached_hit,
+            },
+            reward=0.0,
+            finished=False
+        )
+
+    def _find_in_content(
+        self,
+        params: FetchUrlInput,
+        raw_content: str,
+        page_size: int,
+        total_pages: int,
+    ) -> ToolOutput:
+        needle = params.find or ""
+        haystack = raw_content.lower()
+        target = needle.lower()
+
+        matches = []
+        start = haystack.find(target)
+        while start != -1 and len(matches) < MAX_FIND_MATCHES:
+            page = start // page_size + 1
+            excerpt_start = max(0, start - FIND_CONTEXT_CHARS)
+            excerpt_end = min(len(raw_content), start + len(needle) + FIND_CONTEXT_CHARS)
+            matches.append((page, raw_content[excerpt_start:excerpt_end]))
+            start = haystack.find(target, start + max(1, len(target)))
+
+        if not matches:
+            display_text = (
+                f"'{needle}' does not appear in {params.url} "
+                f"({total_pages} page(s) of text). Try a shorter or differently "
+                f"worded phrase, or read a page directly with the page parameter."
+            )
+        else:
+            pages = sorted({p for p, _ in matches})
+            lines = [
+                f"'{needle}' found in {params.url} on page(s) "
+                f"{', '.join(str(p) for p in pages)} of {total_pages}."
+            ]
+            for page, excerpt in matches:
+                lines.append(f"\n--- page {page} ---\n...{excerpt}...")
+            lines.append(
+                f"\n[Use fetch_url with page=<n> to read a full page]"
+            )
+            display_text = "\n".join(lines)
+
+        return ToolOutput(
+            blocks=[TextBlock(type="text", text=display_text)],
+            metadata={
+                "url": params.url,
+                "find": needle,
+                "match_pages": sorted({p for p, _ in matches}),
+                "match_count": len(matches),
+                "total_pages": total_pages,
+                "total_length": len(raw_content),
             },
             reward=0.0,
             finished=False

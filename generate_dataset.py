@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -270,6 +271,21 @@ TRIVIAL_REASONS = {
 # Minimum exclusion reason length
 MIN_REASON_LENGTH = 10
 
+INVALID_REF_REGEXES = [
+    re.compile(r"^(?:tables?|figures?|fig|appendix|annex|box|panel|supplement"
+               r"|supplementary|supporting)\b"),
+    re.compile(r"\btables?\s*s\d+\b"),
+    re.compile(r"^[a-z]?\d+-[a-z]+-\d+"),
+]
+
+META_REGEXES = [
+    re.compile(r"\bnot\s+(?:provided|included|available|present|reproduced|given)\b"
+               r"[^.]{0,80}\b(?:review|content|text|article|document|here)\b"),
+    re.compile(r"\bnot\s+(?:retrievable|extractable|accessible)\b"),
+    re.compile(r"\btables?\s+s\d+\b"),
+    re.compile(r"\b(?:see|in)\s+the\s+online\s+version\b"),
+]
+
 # Max excluded studies to take from one review (for diversity)
 MAX_PER_REVIEW = 10
 
@@ -442,7 +458,7 @@ async def extract_from_review(
                 continue
             ref = entry.get("study_ref", "").strip()
             reason = entry.get("exclusion_reason", "").strip()
-            if ref and reason:
+            if ref and reason and not is_invalid_study_ref(ref):
                 studies.append(ExcludedStudy(study_ref=ref, exclusion_reason=reason))
 
         if not studies:
@@ -467,6 +483,20 @@ def format_question(study_ref: str, research_question: str) -> str:
         f"following research question: {research_question} What was their "
         f"justification for excluding this study?"
     )
+
+
+def is_invalid_study_ref(ref: str) -> bool:
+    """Check if a study identifier is really a pointer to a container (a table,
+    appendix or supplement) or a bibliography anchor, rather than a study."""
+    lower = ref.lower().strip().rstrip(".")
+    if len(lower) < 3:
+        return True
+    if not any(c.isalpha() for c in lower):
+        return True
+    for pattern in INVALID_REF_REGEXES:
+        if pattern.search(lower):
+            return True
+    return False
 
 
 def is_trivial_reason(reason: str) -> bool:
@@ -494,9 +524,15 @@ def is_trivial_reason(reason: str) -> bool:
         "could not find",
         "not found in",
         "table/section",
+        "supporting information",
+        "not included here",
+        "not reproduced here",
     ]
     for pattern in meta_patterns:
         if pattern in lower:
+            return True
+    for pattern in META_REGEXES:
+        if pattern.search(lower):
             return True
     return False
 
