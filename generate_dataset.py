@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -270,6 +271,14 @@ TRIVIAL_REASONS = {
 # Minimum exclusion reason length
 MIN_REASON_LENGTH = 10
 
+META_REGEXES = [
+    re.compile(r"\bnot\s+(?:provided|included|available|present|reproduced|given)\b"
+               r"[^.]{0,80}\b(?:review|content|text|article|document|here)\b"),
+    re.compile(r"\bnot\s+(?:retrievable|extractable|accessible)\b"),
+    re.compile(r"\btables?\s+s\d+\b"),
+    re.compile(r"\b(?:see|in)\s+the\s+online\s+version\b"),
+]
+
 # Max excluded studies to take from one review (for diversity)
 MAX_PER_REVIEW = 10
 
@@ -494,9 +503,15 @@ def is_trivial_reason(reason: str) -> bool:
         "could not find",
         "not found in",
         "table/section",
+        "supporting information",
+        "not included here",
+        "not reproduced here",
     ]
     for pattern in meta_patterns:
         if pattern in lower:
+            return True
+    for pattern in META_REGEXES:
+        if pattern.search(lower):
             return True
     return False
 
