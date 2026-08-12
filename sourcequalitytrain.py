@@ -15,9 +15,9 @@ import openai
 from pydantic import BaseModel, Field
 from typing import Dict, List
 
-from tavily import AsyncTavilyClient
 
 from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, terminal, tool
+from openreward.toolsets import WebToolset
 
 from constants import SOURCEQUALITYTRAIN_JSONL
 
@@ -66,17 +66,6 @@ class SourceQualityTaskSpec(BaseModel):
     excluded_study_doi: str
     research_question: str
     exclusion_domain: str
-
-
-class WebSearchInput(BaseModel):
-    """Parameters for web_search tool"""
-    query: str = Field(..., description="Search query to find systematic review or study information")
-
-
-class FetchUrlInput(BaseModel):
-    """Parameters for fetch_url tool"""
-    url: str = Field(..., description="URL to fetch (e.g., PubMed Central systematic review page)")
-    page: int = Field(default=1, description="Page number to retrieve (1-indexed). Each page contains ~10,000 characters.")
 
 
 class SubmitAnswerParams(BaseModel):
@@ -144,10 +133,23 @@ class SourceQualityTrain(Environment):
     Agent workflow:
     1. Receives a question about why a study was excluded from a systematic review
     2. Uses web_search tool to find the relevant systematic review
-    3. Uses fetch_url tool to read the review's excluded studies table
+    3. Uses web_fetch tool to read the review's excluded studies table
     4. Submits the exclusion reason with explanation for LLM-based grading
     5. Receives reward (1.0 correct, 0.0 incorrect) and feedback
     """
+
+    # web_search / web_fetch come from the SDK rather than being hand-rolled here.
+    # Which provider answers is process configuration (OPENREWARD_SEARCH_BACKEND,
+    # default "backsearch"), so changing search provider needs no change here.
+    #
+    # The toolset owns the error split too: an unfetchable page stays tool output
+    # the agent can act on, while a missing key or exhausted quota raises so the
+    # rollout ends with a blank reward rather than a score that reads as a bad answer.
+    toolsets = [WebToolset]
+
+    # Search hits keep their snippets, as the prompt promises. Off in the SDK by
+    # default, which would force a fetch per candidate just to triage results.
+    web_include_snippets = True
 
     def __init__(self, task_spec: JSONObject, secrets: dict[str, str] = {}) -> None:
         """
@@ -155,7 +157,8 @@ class SourceQualityTrain(Environment):
 
         Args:
             task_spec: Task specification with question, answer, review_url, etc.
-            secrets: Must contain "openai_api_key" for grading and "tavily_api_key" for search
+            secrets: Must contain "openai_api_key" for grading; search credentials
+                (api_key / tavily_api_key) are forwarded to the search backend
 
         Raises:
             ValueError: If required API keys missing or task_spec invalid
@@ -168,19 +171,16 @@ class SourceQualityTrain(Environment):
         if not openai_api_key:
             raise ValueError(
                 "openai_api_key required in secrets parameter for LLM grading. "
-                "Pass secrets={'openai_api_key': 'sk-...', 'tavily_api_key': 'tvly-...'} when creating session."
+                "Pass secrets={'openai_api_key': 'sk-...'} when creating session."
             )
 
-        # Require Tavily API key for web search - fail fast if missing
-        tavily_api_key = secrets.get("tavily_api_key")
-        if not tavily_api_key:
-            raise ValueError(
-                "tavily_api_key required in secrets parameter for web search. "
-                "Pass secrets={'openai_api_key': 'sk-...', 'tavily_api_key': 'tvly-...'} when creating session."
-            )
+        # Read live by WebToolset on every tool call, so the search backend takes its
+        # credentials from the session rather than the server process. The configured
+        # backend picks the key it needs: `api_key` for backsearch, `tavily_api_key`
+        # for tavily. No up-front check — which key is required depends on the backend.
+        self.search_secrets = secrets
 
         self.openai_client = openai.AsyncClient(api_key=openai_api_key)
-        self.tavily_client = AsyncTavilyClient(api_key=tavily_api_key)
 
     @classmethod
     def list_splits(cls) -> list[str]:
@@ -232,159 +232,6 @@ class SourceQualityTrain(Environment):
             "preamble or closing remarks."
         )
         return [TextBlock(type="text", text=text)]
-
-    async def _tavily_with_retry(self, label: str, call, *, max_attempts: int = 4):
-        """Call Tavily with exponential backoff, re-raising on persistent failure.
-
-        A genuinely-down dependency (exhausted quota, auth error) exhausts the
-        retries and re-raises, so the SDK marks the call ToolFailed and ends the
-        rollout. `call` returns a fresh awaitable on each attempt.
-        """
-        last_exc: Exception | None = None
-        for attempt in range(max_attempts):
-            try:
-                return await call()
-            except Exception as e:
-                last_exc = e
-                if attempt < max_attempts - 1:
-                    wait = min(2 ** attempt, 30)
-                    print(f"TAVILY ERROR: {label} | {e} | retry in {wait}s (attempt {attempt + 1}/{max_attempts})")
-                    await asyncio.sleep(wait)
-        assert last_exc is not None
-        raise last_exc
-
-    @tool
-    async def web_search(self, params: WebSearchInput) -> ToolOutput:
-        """
-        Search the web for systematic review or study information using Tavily.
-        Returns search results with titles, URLs, and snippets.
-        """
-        response = await self._tavily_with_retry(
-            f"search({params.query!r})",
-            lambda: self.tavily_client.search(
-                query=params.query,
-                search_depth="basic",
-                max_results=5,
-            ),
-        )
-
-        results = response.get("results", [])
-        if not results:
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text="No search results found. Try a different query.")],
-                metadata={"query": params.query, "results": []},
-                reward=0.0,
-                finished=False
-            )
-
-        display_parts = [f"Search results for: {params.query}\n"]
-        for i, result in enumerate(results, 1):
-            title = result.get("title", "No title")
-            url = result.get("url", "")
-            snippet = result.get("content", "")
-            display_parts.append(f"{i}. {title}\n   URL: {url}\n   {snippet}\n")
-
-        display_text = "\n".join(display_parts)
-
-        return ToolOutput(
-            blocks=[TextBlock(type="text", text=display_text)],
-            metadata={
-                "query": params.query,
-                "results": results,
-                "count": len(results)
-            },
-            reward=0.0,
-            finished=False
-        )
-
-    @tool
-    async def fetch_url(self, params: FetchUrlInput) -> ToolOutput:
-        """
-        Fetch and return the text content from a specific URL using Tavily's extract method.
-        Use this to read systematic review pages from PubMed Central.
-        Content is paginated - use the page parameter to retrieve additional pages.
-        """
-        PAGE_SIZE = 10000  # Characters per page
-
-        # extract_depth="advanced" pulls more of the rendered page than the default
-        # basic depth — needed for large/JS-heavy PMC articles that otherwise come
-        # back empty or near-empty.
-        response = await self._tavily_with_retry(
-            f"extract({params.url!r})",
-            lambda: self.tavily_client.extract(
-                urls=[params.url],
-                extract_depth="advanced",
-                format="text",
-            ),
-        )
-
-        results = response.get("results", [])
-        if not results:
-            # Tavily produced no result object at all — usually a fetch
-            # failure (DNS/timeout/blocked) or an unsupported URL.
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text=(
-                    f"Could not fetch {params.url}: the extractor returned "
-                    f"no result. The URL may be unreachable, blocked, or "
-                    f"invalid. Try a different source or the article's PMC URL."
-                ))],
-                metadata={"url": params.url, "results": []},
-                reward=0.0,
-                finished=False
-            )
-
-        raw_content = results[0].get("raw_content", "") or ""
-        if not raw_content.strip():
-            # A result came back but with no usable text — typically a
-            # JavaScript-gated page that renders content client-side, so the
-            # extractor saw only an empty shell. Surface that explicitly so
-            # the agent picks a different source instead of re-paging into an
-            # opaque empty response.
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text=(
-                    f"No readable text could be extracted from {params.url}. "
-                    f"The page appears to be JavaScript-gated or otherwise "
-                    f"served no content to the extractor. Try the article's "
-                    f"PubMed Central (PMC) full-text URL or a direct data/API "
-                    f"endpoint instead."
-                ))],
-                metadata={"url": params.url, "results": results, "empty_content": True},
-                reward=0.0,
-                finished=False
-            )
-
-        total_length = len(raw_content)
-
-        # Calculate pagination
-        total_pages = max(1, (total_length + PAGE_SIZE - 1) // PAGE_SIZE)
-        page = max(1, min(params.page, total_pages))
-
-        # Extract the requested page
-        start_idx = (page - 1) * PAGE_SIZE
-        end_idx = min(start_idx + PAGE_SIZE, total_length)
-        page_content = raw_content[start_idx:end_idx]
-
-        # Build display text with pagination info
-        if total_pages == 1:
-            display_text = f"Content from {params.url}:\n\n{page_content}"
-        else:
-            display_text = f"Content from {params.url} (Page {page}/{total_pages}):\n\n{page_content}"
-            if page < total_pages:
-                display_text += f"\n\n[Use fetch_url with page={page + 1} to see more content]"
-
-        return ToolOutput(
-            blocks=[TextBlock(type="text", text=display_text)],
-            metadata={
-                "url": params.url,
-                "page": page,
-                "total_pages": total_pages,
-                "total_length": total_length,
-                "page_start": start_idx,
-                "page_end": end_idx
-            },
-            reward=0.0,
-            finished=False
-        )
 
     async def _grade_answer(
         self,

@@ -64,10 +64,15 @@ Data is stored on the OpenReward platform.
 
 | Tool | Description |
 |------|-------------|
-| `web_search` | Search the web using Tavily. Returns titles, URLs, and snippets. |
-| `fetch_url` | Fetch full text content from a URL using Tavily extract. Supports pagination for long documents. |
+| `web_search` | Search the web. Returns titles, URLs, and snippets. |
+| `web_fetch` | Fetch full text content from a URL via the configured search backend. Supports pagination for long documents. |
 
-Grading uses a hidden `@terminal` tool: the agent's final plain-text message is the answer, graded by an LLM judge (`gpt-5-mini`) for semantic equivalence against the reference exclusion reason. The `web_search` / `fetch_url` tools require Tavily but are optional — you can exclude them and use external tools instead.
+Grading uses a hidden `@terminal` tool: the agent's final plain-text message is the answer, graded by an LLM judge (`gpt-5-mini`) for semantic equivalence against the reference exclusion reason. Search and fetch come from the OpenReward SDK's `WebToolset`, so the provider is configuration on the environment server rather than code here:
+
+| `OPENREWARD_SEARCH_BACKEND` | Backend | Needs |
+|---|---|---|
+| unset (default) | `backsearch` — GR's backdated corpus, bounded to an `as_of` cutoff | `OPENREWARD_API_KEY`, or `api_key` in session secrets |
+| `tavily` | Tavily — live web | `TAVILY_API_KEY`, or `tavily_api_key` in session secrets |
 
 ## Time Horizon
 
@@ -81,7 +86,7 @@ SourceQualityTrain is a multi-turn environment. Agents typically search for the 
 
 This environment requires the following API keys passed via the `secrets` parameter:
 - `openai_api_key`: For LLM-based answer grading
-- `tavily_api_key`: For web search and URL content extraction
+- Search credentials — whichever the configured backend needs: `api_key` for the default backsearch backend, or `tavily_api_key` when the server runs with `OPENREWARD_SEARCH_BACKEND=tavily`. Both fall back to the server process environment (`OPENREWARD_API_KEY` / `TAVILY_API_KEY`).
 
 ## Safety
 

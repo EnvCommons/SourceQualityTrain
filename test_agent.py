@@ -1,7 +1,7 @@
 """Test agent for SourceQualityTrain (terminal-tool style).
 
 The environment uses a hidden @terminal `submit_answer`: agents use
-`web_search` and `fetch_url` to find the systematic review and its excluded
+`web_search` and `web_fetch` to find the systematic review and its excluded
 studies table, then reply with the verbatim exclusion reason as an ordinary
 message. The gpt-5-mini judge grades semantic equivalence.
 
@@ -36,12 +36,12 @@ async def main():
     NUM_TASKS = int(os.environ.get("NUM_TASKS", "1"))
     MAX_TURNS = int(os.environ.get("MAX_TURNS", "40"))
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+    # Optional: whichever the server's OPENREWARD_SEARCH_BACKEND needs.
+    TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+    OPENREWARD_API_KEY = os.getenv("OPENREWARD_API_KEY", "")
 
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY environment variable required")
-    if not TAVILY_API_KEY:
-        raise ValueError("TAVILY_API_KEY environment variable required")
 
     base_url = "http://localhost:8080" if os.environ.get("LOCAL") else None
     environment = or_client.environments.get(name=ENV_NAME, base_url=base_url)
@@ -64,7 +64,8 @@ async def main():
             task=task,
             secrets={
                 "openai_api_key": OPENAI_API_KEY,
-                "tavily_api_key": TAVILY_API_KEY,
+                **({"tavily_api_key": TAVILY_API_KEY} if TAVILY_API_KEY else {}),
+                **({"api_key": OPENREWARD_API_KEY} if OPENREWARD_API_KEY else {}),
             },
         ) as session:
             assistant_ends_rollout = await session.is_assistant_message_final()
